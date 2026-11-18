@@ -1,16 +1,30 @@
-name: Release image
+name: Release images
 
-# Decides whether a tested build is a release (scripts/semver-level.sh), records it in versions.lock
-# and a git tag, then pushes, signs and tags the image.
+# One release for every image of a repository: decides whether the tested builds are a release and at which
+# SemVer level (scripts/semver-level.sh), records versions.lock and a git tag, then pushes, tags and signs
+# each image and writes one GitHub Release.
 #
-# Order matters: the git commit and tag come first, registry tags last. A run that fails after the
-# git push is resumed by the next run (mode "resume"), because the immutable image tag is still missing.
+# Order matters: the git commit and tag come first, registry tags last. A run that fails after the git push
+# is resumed by a later run (mode "resume"): images whose immutable tag is still missing get published,
+# images that already have it are skipped.
+#
+# Reads the facts__<key>__<arch> artifacts that build-image.yaml wrote in the same workflow run.
 
 on:
   workflow_call:
     inputs:
       image:
-        description: Image name without tag, e.g. ghcr.io/owner/alpine-minimal.
+        description: Image name without tag, e.g. ghcr.io/owner/python-minimal.
+        type: string
+        required: true
+      images:
+        description: >-
+          JSON list, one entry per image: {"key", "target", "build-args", "tag-suffix", "major-tag", "latest",
+          "version-command"}. Same keys, targets and build arguments as given to build-image.yaml.
+        type: string
+        required: true
+      base:
+        description: JSON {"image", "digest", "alpineVersion"} of the base image the builds were pinned to.
         type: string
         required: true
       context:
@@ -25,26 +39,10 @@ on:
         description: Same named build contexts as given to build-image.yaml.
         type: string
         default: ""
-      build-args:
-        description: Same build arguments as given to build-image.yaml.
-        type: string
-        default: ""
       test-script:
-        description: Same test entry point as given to build-image.yaml; run again against the pushed image.
+        description: Same test entry point as given to build-image.yaml; run again against each pushed image.
         type: string
         default: tests/run.sh
-      alpine-version:
-        description: build-image.yaml output alpine-version.
-        type: string
-        required: true
-      alpine-digest:
-        description: Digest of the upstream alpine image the build was pinned to.
-        type: string
-        required: true
-      packages-json:
-        description: build-image.yaml output packages-json.
-        type: string
-        required: true
       level:
         description: Raise the computed SemVer level to at least this one (none|patch|minor|major).
         type: string
@@ -53,14 +51,10 @@ on:
         description: Space-separated paths whose changes since the last release count as a patch.
         type: string
         default: Dockerfile rootfs
-      tag-suffix:
-        description: Appended to every upstream tag, e.g. "-fpm". Empty for alpine-minimal.
-        type: string
-        default: ""
-      latest:
-        description: Also point the `latest` tag at this release. Set it only for the top version line's runtime variant.
+      dry-run:
+        description: Decide and report version, tags and versions.lock in the run summary, but write nothing.
         type: boolean
-        default: true
+        default: false
 
 permissions: {}
 
@@ -81,6 +75,8 @@ jobs:
       level: ${{ steps.level.outputs.level }}
       version: ${{ steps.level.outputs.version }}
       reason: ${{ steps.level.outputs.reason }}
+      state: ${{ steps.state.outputs.state }}
+      push-matrix: ${{ steps.state.outputs.push-matrix }}
     steps:
       - name: Check out default branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -107,13 +103,56 @@ jobs:
           fi
           echo "stale=false" >> "$GITHUB_OUTPUT"
 
+      - name: Download image facts
+        if: steps.head.outputs.stale == 'false'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: facts__*
+          path: ${{ runner.temp }}/facts
+
+      - name: Build state
+        id: state
+        if: steps.head.outputs.stale == 'false'
+        env:
+          IMAGES: ${{ inputs.images }}
+          BASE: ${{ inputs.base }}
+        run: |
+          facts=$(jq -s '.' "$RUNNER_TEMP"/facts/*/facts.json)
+          problems=$(jq -n -r --argjson facts "$facts" --argjson images "$IMAGES" --argjson base "$BASE" '
+            [ ($images[] | .key as $k
+                | select(([$facts[] | select(.key == $k)] | length) != 2)
+                | "image \($k): expected facts for 2 architectures"),
+              ($facts[] | select(.alpineVersion != $base.alpineVersion)
+                | "image \(.key) \(.platform): Alpine \(.alpineVersion), base says \($base.alpineVersion)") ]
+            | .[]')
+          if [ -n "$problems" ]; then
+            printf '::error::%s\n' "$problems"
+            exit 1
+          fi
+          state=$(jq -n -c --argjson facts "$facts" --argjson images "$IMAGES" --argjson base "$BASE" '{
+            base: $base,
+            images: ($images | map(.key as $k | {($k): {
+              upstreamVersion: ([$facts[] | select(.key == $k) | .upstreamVersion] | first),
+              packages: ([$facts[] | select(.key == $k) | {(.platform): .packagesSha256}] | add)
+            }}) | add)
+          }')
+          push_matrix=$(jq -n -c --argjson images "$IMAGES" '[
+            $images[] as $i
+            | ({platform: "linux/amd64", arch: "amd64", runner: "ubuntu-24.04"},
+               {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"})
+            | . + {key: $i.key, target: ($i.target // ""), "build-args": ($i["build-args"] // ""),
+                   "version-command": ($i["version-command"] // "cat /etc/alpine-release")}
+          ]')
+          {
+            echo "state=$state"
+            echo "push-matrix=$push_matrix"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Compute level
         id: level
         if: steps.head.outputs.stale == 'false'
         env:
-          ALPINE_VERSION: ${{ inputs.alpine-version }}
-          ALPINE_DIGEST: ${{ inputs.alpine-digest }}
-          PACKAGES_JSON: ${{ inputs.packages-json }}
+          STATE: ${{ steps.state.outputs.state }}
           LEVEL: ${{ inputs.level }}
           RELEASE_PATHS: ${{ inputs.release-paths }}
         run: |
@@ -123,29 +162,66 @@ jobs:
           if [ -n "$last_tag" ] && git diff --quiet "$last_tag" HEAD -- $RELEASE_PATHS; then
             files_changed=false
           fi
-          sh .container-workflows/scripts/semver-level.sh versions.lock \
-            "$ALPINE_VERSION" "$ALPINE_DIGEST" "$PACKAGES_JSON" "$files_changed" "$LEVEL" >> "$GITHUB_OUTPUT"
+          sh .container-workflows/scripts/semver-level.sh versions.lock "$STATE" "$files_changed" "$LEVEL" >> "$GITHUB_OUTPUT"
 
       - name: Decide mode
         id: mode
         if: steps.head.outputs.stale == 'false'
         env:
           IMAGE: ${{ inputs.image }}
+          IMAGES: ${{ inputs.images }}
+          STATE: ${{ steps.state.outputs.state }}
           LEVEL: ${{ steps.level.outputs.level }}
           VERSION: ${{ steps.level.outputs.version }}
-          TAG_BASE: ${{ inputs.alpine-version }}
-          TAG_SUFFIX: ${{ inputs.tag-suffix }}
+          REASON: ${{ steps.level.outputs.reason }}
+          DRY_RUN: ${{ inputs.dry-run }}
         run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "## Dry run: nothing was written"
+              echo
+              echo "- Level: $LEVEL ($REASON)"
+              echo "- Version: $VERSION"
+              echo
+              echo "| Image | Upstream | Tags |"
+              echo "|---|---|---|"
+              printf '%s' "$IMAGES" | jq -c '.[]' | while IFS= read -r entry; do
+                key=$(printf '%s' "$entry" | jq -r '.key')
+                upstream=$(printf '%s' "$STATE" | jq -r --arg k "$key" '.images[$k].upstreamVersion')
+                tags=$(sh .container-workflows/scripts/compute-tags.sh "$upstream" \
+                  "$(printf '%s' "$entry" | jq -r '.["tag-suffix"] // ""')" "$VERSION" \
+                  "$(printf '%s' "$entry" | jq -r '.["major-tag"] // false')" \
+                  "$(printf '%s' "$entry" | jq -r '.latest // false')" | paste -sd ' ' -)
+                echo "| $key | $upstream | $tags |"
+              done
+              echo
+              echo "versions.lock that a release would write:"
+              echo
+              echo '```json'
+              printf '%s' "$STATE" | jq --arg v "$VERSION" '{version: $v} + .'
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "mode=dry-run" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$LEVEL" != "none" ]; then
             echo "mode=release" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          immutable_tag="$TAG_BASE$TAG_SUFFIX-$VERSION"
-          if docker buildx imagetools inspect "$IMAGE:$immutable_tag" > /dev/null 2>&1; then
+          missing=""
+          for key in $(printf '%s' "$IMAGES" | jq -r '.[].key'); do
+            entry=$(printf '%s' "$IMAGES" | jq -c --arg k "$key" '.[] | select(.key == $k)')
+            upstream=$(jq -r --arg k "$key" '.images[$k].upstreamVersion' versions.lock)
+            suffix=$(printf '%s' "$entry" | jq -r '.["tag-suffix"] // ""')
+            if ! docker buildx imagetools inspect "$IMAGE:$upstream$suffix-$VERSION" > /dev/null 2>&1; then
+              missing="$missing $key"
+            fi
+          done
+          if [ -z "$missing" ]; then
             echo "mode=none" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::notice::Release $VERSION is recorded but $IMAGE:$immutable_tag is missing; resuming."
+          echo "::notice::Release $VERSION is recorded but not published for:$missing; resuming."
           echo "mode=resume" >> "$GITHUB_OUTPUT"
 
       - name: Heartbeat
@@ -179,14 +255,10 @@ jobs:
           VERSION: ${{ needs.decide.outputs.version }}
           LEVEL: ${{ needs.decide.outputs.level }}
           REASON: ${{ needs.decide.outputs.reason }}
-          ALPINE_VERSION: ${{ inputs.alpine-version }}
-          ALPINE_DIGEST: ${{ inputs.alpine-digest }}
-          PACKAGES_JSON: ${{ inputs.packages-json }}
+          STATE: ${{ needs.decide.outputs.state }}
           BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          jq -n --arg version "$VERSION" --arg alpine "$ALPINE_VERSION" --arg digest "$ALPINE_DIGEST" \
-            --argjson packages "$PACKAGES_JSON" \
-            '{version: $version, alpineVersion: $alpine, alpineDigest: $digest, packages: $packages}' > versions.lock
+          printf '%s' "$STATE" | jq --arg v "$VERSION" '{version: $v} + .' > versions.lock
           git config user.name "$BOT_NAME"
           git config user.email "$BOT_EMAIL"
           git add versions.lock
@@ -196,7 +268,7 @@ jobs:
           git push --atomic origin "HEAD:refs/heads/$BRANCH" "refs/tags/v$VERSION"
 
   push:
-    name: Push (${{ matrix.platform }})
+    name: Push (${{ matrix.key }}, ${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     needs: [decide, record]
     if: >-
@@ -209,13 +281,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        include:
-          - platform: linux/amd64
-            arch: amd64
-            runner: ubuntu-24.04
-          - platform: linux/arm64
-            arch: arm64
-            runner: ubuntu-24.04-arm
+        include: ${{ fromJSON(needs.decide.outputs.push-matrix) }}
     steps:
       - name: Check out caller repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -243,33 +309,41 @@ jobs:
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.file }}
+          target: ${{ matrix.target }}
           platforms: ${{ matrix.platform }}
           build-contexts: ${{ inputs.build-contexts }}
-          build-args: ${{ inputs.build-args }}
+          build-args: ${{ matrix.build-args }}
           outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: false
-          cache-from: type=gha,scope=${{ github.repository }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ github.repository }}-${{ matrix.key }}-${{ matrix.arch }}
 
       - name: Verify pushed image equals the tested one
         env:
           IMAGE_REF: ${{ inputs.image }}@${{ steps.build.outputs.digest }}
+          KEY: ${{ matrix.key }}
           PLATFORM: ${{ matrix.platform }}
-          PACKAGES_JSON: ${{ inputs.packages-json }}
-          ALPINE_VERSION: ${{ inputs.alpine-version }}
+          VERSION_COMMAND: ${{ matrix.version-command }}
+          STATE: ${{ needs.decide.outputs.state }}
         run: |
-          sh .container-workflows/scripts/image-facts.sh "$IMAGE_REF" > "$RUNNER_TEMP/facts.env"
-          expected=$(printf '%s' "$PACKAGES_JSON" | jq -r --arg p "$PLATFORM" '.[$p]')
-          actual=$(sed -n 's/^packages-sha256=//p' "$RUNNER_TEMP/facts.env")
+          sh .container-workflows/scripts/image-facts.sh "$IMAGE_REF" "$VERSION_COMMAND" > "$RUNNER_TEMP/facts.env"
+          expected_packages=$(printf '%s' "$STATE" | jq -r --arg k "$KEY" --arg p "$PLATFORM" '.images[$k].packages[$p]')
+          expected_upstream=$(printf '%s' "$STATE" | jq -r --arg k "$KEY" '.images[$k].upstreamVersion')
+          expected_alpine=$(printf '%s' "$STATE" | jq -r '.base.alpineVersion')
+          actual_packages=$(sed -n 's/^packages-sha256=//p' "$RUNNER_TEMP/facts.env")
+          actual_upstream=$(sed -n 's/^upstream-version=//p' "$RUNNER_TEMP/facts.env")
           actual_alpine=$(sed -n 's/^alpine-version=//p' "$RUNNER_TEMP/facts.env")
-          if [ "$expected" != "$actual" ] || [ "$ALPINE_VERSION" != "$actual_alpine" ]; then
-            echo "::error::Pushed image differs from the tested build (packages $actual vs $expected, Alpine $actual_alpine vs $ALPINE_VERSION)"
+          if [ "$expected_packages" != "$actual_packages" ] \
+            || [ "$expected_upstream" != "$actual_upstream" ] \
+            || [ "$expected_alpine" != "$actual_alpine" ]; then
+            echo "::error::Pushed image differs from the tested build (packages $actual_packages vs $expected_packages, upstream $actual_upstream vs $expected_upstream, Alpine $actual_alpine vs $expected_alpine)"
             exit 1
           fi
 
       - name: Test pushed image
         env:
           IMAGE: ${{ inputs.image }}@${{ steps.build.outputs.digest }}
+          IMAGE_KEY: ${{ matrix.key }}
           TEST_SCRIPT: ${{ inputs.test-script }}
         run: ./"$TEST_SCRIPT"
 
@@ -277,36 +351,46 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          mkdir -p "$RUNNER_TEMP/digests"
-          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/${{ matrix.arch }}"
+          mkdir -p "$RUNNER_TEMP/digest"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digest/${{ matrix.arch }}"
 
       - name: Upload digest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: digest-${{ matrix.arch }}
-          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          name: digest__${{ matrix.key }}__${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest/${{ matrix.arch }}
           retention-days: 1
 
   publish:
-    name: Tag, sign and publish
+    name: Tag and sign (${{ matrix.image.key }})
     runs-on: ubuntu-24.04
     needs: [decide, push]
     if: always() && needs.push.result == 'success'
     permissions:
-      contents: write
+      contents: read
       packages: write
       id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(inputs.images) }}
     env:
       IMAGE: ${{ inputs.image }}
+      KEY: ${{ matrix.image.key }}
       VERSION: ${{ needs.decide.outputs.version }}
-      ALPINE_VERSION: ${{ inputs.alpine-version }}
-      TAG_SUFFIX: ${{ inputs.tag-suffix }}
-      LATEST: ${{ inputs.latest }}
+      STATE: ${{ needs.decide.outputs.state }}
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .container-workflows
+
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: digest-*
+          pattern: digest__${{ matrix.image.key }}__*
           path: digests
           merge-multiple: true
 
@@ -325,36 +409,36 @@ jobs:
 
       - name: Create tags
         id: tags
+        env:
+          TAG_SUFFIX: ${{ matrix.image.tag-suffix }}
+          MAJOR_TAG: ${{ matrix.image.major-tag }}
+          LATEST: ${{ matrix.image.latest }}
         run: |
-          minor=${ALPINE_VERSION%.*}
-          major=${ALPINE_VERSION%%.*}
-          immutable="$ALPINE_VERSION$TAG_SUFFIX-$VERSION"
+          upstream=$(printf '%s' "$STATE" | jq -r --arg k "$KEY" '.images[$k].upstreamVersion')
+          sh .container-workflows/scripts/compute-tags.sh "$upstream" "${TAG_SUFFIX:-}" "$VERSION" \
+            "${MAJOR_TAG:-false}" "${LATEST:-false}" > "$RUNNER_TEMP/tags"
+          immutable=$(head -n 1 "$RUNNER_TEMP/tags")
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "list=$(paste -sd ',' "$RUNNER_TEMP/tags" | sed 's/,/, /g')" >> "$GITHUB_OUTPUT"
           if docker buildx imagetools inspect "$IMAGE:$immutable" > /dev/null 2>&1; then
-            echo "::error::$IMAGE:$immutable already exists; refusing to overwrite an immutable tag"
-            exit 1
+            echo "::notice::$IMAGE:$immutable already exists (published by an earlier run); skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            set --
+            while IFS= read -r tag; do
+              set -- "$@" -t "$IMAGE:$tag"
+            done < "$RUNNER_TEMP/tags"
+            for f in digests/*; do
+              set -- "$@" "$IMAGE@$(cat "$f")"
+            done
+            docker buildx imagetools create "$@"
           fi
-          list="$ALPINE_VERSION$TAG_SUFFIX, $minor$TAG_SUFFIX, $major$TAG_SUFFIX, $immutable"
-          set -- \
-            -t "$IMAGE:$immutable" \
-            -t "$IMAGE:$ALPINE_VERSION$TAG_SUFFIX" \
-            -t "$IMAGE:$minor$TAG_SUFFIX" \
-            -t "$IMAGE:$major$TAG_SUFFIX"
-          if [ "$LATEST" = "true" ]; then
-            set -- "$@" -t "$IMAGE:latest"
-            list="$list, latest"
-          fi
-          for f in digests/*; do
-            set -- "$@" "$IMAGE@$(cat "$f")"
-          done
-          docker buildx imagetools create "$@"
           digest=$(docker buildx imagetools inspect "$IMAGE:$immutable" --format '{{json .Manifest}}' | jq -r '.digest')
-          {
-            echo "digest=$digest"
-            echo "immutable=$immutable"
-            echo "list=$list"
-          } >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Sign and attest
+        if: steps.tags.outputs.skip == 'false'
         env:
           DIGEST: ${{ steps.tags.outputs.digest }}
         run: |
@@ -370,25 +454,59 @@ jobs:
           cosign attest --yes --type cyclonedx --predicate "$RUNNER_TEMP/out/cyclonedx.json" "$ref"
           cosign attest --yes --type vuln --predicate "$RUNNER_TEMP/out/cosign-vuln.json" "$ref"
 
-      - name: Publish GitHub Release
+      - name: Record published image
+        env:
+          UPSTREAM: ${{ steps.tags.outputs.upstream }}
+          DIGEST: ${{ steps.tags.outputs.digest }}
+          TAGS: ${{ steps.tags.outputs.list }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/published"
+          jq -n --arg key "$KEY" --arg upstream "$UPSTREAM" --arg digest "$DIGEST" --arg tags "$TAGS" \
+            '{key: $key, upstreamVersion: $upstream, digest: $digest, tags: $tags}' > "$RUNNER_TEMP/published/published.json"
+
+      - name: Upload published image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: published__${{ matrix.image.key }}
+          path: ${{ runner.temp }}/published/published.json
+          retention-days: 1
+
+  notes:
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [decide, publish]
+    if: always() && needs.publish.result == 'success'
+    permissions:
+      contents: write
+    steps:
+      - name: Download published images
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: published__*
+          path: published
+
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ needs.decide.outputs.version }}
           LEVEL: ${{ needs.decide.outputs.level }}
           REASON: ${{ needs.decide.outputs.reason }}
-          ALPINE_DIGEST: ${{ inputs.alpine-digest }}
-          DIGEST: ${{ steps.tags.outputs.digest }}
-          TAGS: ${{ steps.tags.outputs.list }}
+          STATE: ${{ needs.decide.outputs.state }}
         run: |
           if gh release view "v$VERSION" > /dev/null 2>&1; then
             echo "::notice::GitHub Release v$VERSION already exists."
             exit 0
           fi
-          notes=$(cat <<EOF
-          - Alpine: $ALPINE_VERSION (upstream digest \`$ALPINE_DIGEST\`)
-          - Level: $LEVEL ($REASON)
-          - Image: \`$IMAGE@$DIGEST\`
-          - Tags: $TAGS
-          EOF
-          )
-          gh release create "v$VERSION" --title "$VERSION (Alpine $ALPINE_VERSION)" --notes "$notes"
+          base=$(printf '%s' "$STATE" | jq -r '"\(.base.image) (Alpine \(.base.alpineVersion), digest `\(.base.digest)`)"')
+          {
+            echo "- Level: $LEVEL ($REASON)"
+            echo "- Base: $base"
+            echo
+            echo "| Image | Version | Tags | Digest |"
+            echo "|---|---|---|---|"
+            jq -s -r --arg image "$IMAGE" 'sort_by(.key)[] | "| \(.key) | \(.upstreamVersion) | \(.tags) | `\($image)@\(.digest)` |"' published/*/published.json
+          } > "$RUNNER_TEMP/notes.md"
+          title=$(jq -s -r 'sort_by(.key) | map("\(.key) \(.upstreamVersion)") | join(", ")' published/*/published.json)
+          gh release create "v$VERSION" --title "$VERSION ($title)" --notes-file "$RUNNER_TEMP/notes.md"
