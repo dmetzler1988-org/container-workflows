@@ -1,0 +1,39 @@
+name: Rescan image
+
+# Scans an already published image again, so vulnerabilities found after its release show up
+# in the GitHub Security tab without a rebuild.
+
+on:
+  workflow_call:
+    inputs:
+      image-ref:
+        description: Published image reference to scan, e.g. ghcr.io/owner/alpine-minimal:3.24.
+        type: string
+        required: true
+
+permissions: {}
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  rescan:
+    name: Rescan ${{ inputs.image-ref }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Scan
+        env:
+          IMAGE_REF: ${{ inputs.image-ref }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/out"
+          docker run --rm -v "$RUNNER_TEMP/out:/out" \
+            "$TRIVY_IMAGE" image --scanners vuln --format sarif --output /out/trivy.sarif "$IMAGE_REF"
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/out/trivy.sarif
+          category: rescan

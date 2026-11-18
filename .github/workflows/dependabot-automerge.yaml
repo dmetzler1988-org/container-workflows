@@ -1,0 +1,30 @@
+name: Dependabot auto-merge
+
+# Call this as the last job of the caller's CI, after build and tests passed, so a merge never
+# happens untested. Merges only GitHub Actions updates. Docker base image updates (e.g. a new
+# Alpine release) change the image's minor version and stay for a human to merge.
+
+on:
+  workflow_call:
+
+permissions: {}
+
+jobs:
+  automerge:
+    name: Merge GitHub Actions update
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Read Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+
+      - name: Merge
+        if: steps.meta.outputs.package-ecosystem == 'github_actions'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --squash "$PR_URL"

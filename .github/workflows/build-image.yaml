@@ -1,0 +1,172 @@
+name: Build image
+
+# Builds the image once per architecture on native runners, tests it and scans it.
+# Pushes nothing: release.yaml pushes, and only when the build is a release.
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Build context, relative to the caller's repository root.
+        type: string
+        default: "."
+      file:
+        description: Dockerfile path, relative to the caller's repository root.
+        type: string
+        default: Dockerfile
+      build-contexts:
+        description: Named build contexts, one per line (e.g. pins the base image digest).
+        type: string
+        default: ""
+      build-args:
+        description: Build arguments, one per line.
+        type: string
+        default: ""
+      test-script:
+        description: Executable test entry point in the caller's repository. Receives the image in $IMAGE.
+        type: string
+        default: tests/run.sh
+    outputs:
+      alpine-version:
+        description: Alpine version inside the built image, identical on all architectures.
+        value: ${{ jobs.collect.outputs.alpine-version }}
+      packages-json:
+        description: JSON object, platform -> sha256 of the installed package list.
+        value: ${{ jobs.collect.outputs.packages-json }}
+
+permissions: {}
+
+env:
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      LOCAL_IMAGE: local/image-under-test:${{ github.run_id }}-${{ matrix.arch }}
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check out workflow scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .container-workflows
+
+      - name: Validate test script path
+        env:
+          TEST_SCRIPT: ${{ inputs.test-script }}
+        run: |
+          case "$TEST_SCRIPT" in
+            /* | *..*) echo "::error::test-script must be a relative path inside the repository"; exit 1 ;;
+          esac
+          if [ ! -x "$TEST_SCRIPT" ]; then
+            echo "::error::$TEST_SCRIPT is missing or not executable"
+            exit 1
+          fi
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.file }}
+          platforms: ${{ matrix.platform }}
+          build-contexts: ${{ inputs.build-contexts }}
+          build-args: ${{ inputs.build-args }}
+          tags: ${{ env.LOCAL_IMAGE }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=${{ github.repository }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ github.repository }}-${{ matrix.arch }}
+
+      - name: Test
+        env:
+          IMAGE: ${{ env.LOCAL_IMAGE }}
+          TEST_SCRIPT: ${{ inputs.test-script }}
+        run: ./"$TEST_SCRIPT"
+
+      - name: Scan (report)
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache" "$RUNNER_TEMP/out"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            -v "$RUNNER_TEMP/out:/out" \
+            "$TRIVY_IMAGE" image --scanners vuln --format sarif --output /out/trivy.sarif "$LOCAL_IMAGE"
+
+      - name: Upload scan results
+        # Forks get no security-events permission.
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: ${{ runner.temp }}/out/trivy.sarif
+          category: build-${{ matrix.arch }}
+
+      - name: Scan (gate on fixable critical vulnerabilities)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache" \
+            "$TRIVY_IMAGE" image --scanners vuln --severity CRITICAL --ignore-unfixed --exit-code 1 "$LOCAL_IMAGE"
+
+      - name: Record image facts
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          sh .container-workflows/scripts/image-facts.sh "$LOCAL_IMAGE" > "$RUNNER_TEMP/facts.env"
+          alpine_version=$(sed -n 's/^alpine-version=//p' "$RUNNER_TEMP/facts.env")
+          packages_sha256=$(sed -n 's/^packages-sha256=//p' "$RUNNER_TEMP/facts.env")
+          jq -n --arg platform "$PLATFORM" --arg alpine "$alpine_version" --arg packages "$packages_sha256" \
+            '{platform: $platform, alpineVersion: $alpine, packagesSha256: $packages}' > "$RUNNER_TEMP/facts.json"
+
+      - name: Upload image facts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: facts-${{ matrix.arch }}
+          path: ${{ runner.temp }}/facts.json
+          retention-days: 1
+
+  collect:
+    name: Collect facts
+    runs-on: ubuntu-24.04
+    needs: build
+    permissions: {}
+    outputs:
+      alpine-version: ${{ steps.merge.outputs.alpine-version }}
+      packages-json: ${{ steps.merge.outputs.packages-json }}
+    steps:
+      - name: Download image facts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: facts-*
+          path: facts
+
+      - name: Merge
+        id: merge
+        run: |
+          versions=$(jq -s -r '[.[].alpineVersion] | unique | .[]' facts/*/facts.json)
+          if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ]; then
+            echo "::error::Alpine version differs between architectures: $versions"
+            exit 1
+          fi
+          echo "alpine-version=$versions" >> "$GITHUB_OUTPUT"
+          echo "packages-json=$(jq -s -c 'map({(.platform): .packagesSha256}) | add' facts/*/facts.json)" >> "$GITHUB_OUTPUT"
