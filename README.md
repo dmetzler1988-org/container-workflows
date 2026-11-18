@@ -45,6 +45,7 @@ against the tested package list), plus:
 | `level` | `none` | Raises the computed level to at least `patch`, `minor` or `major` |
 | `release-paths` | `Dockerfile rootfs` | Paths whose changes since the last release count as a patch |
 | `tag-suffix` | empty | Appended to every tag, e.g. `-fpm` |
+| `latest` | `true` | Also point `latest` at this release. Set it only for the top version line's runtime variant |
 
 Caller job permissions: `contents: write`, `packages: write`, `id-token: write`.
 
@@ -57,8 +58,8 @@ How the level is chosen (`scripts/semver-level.sh`):
 | Alpine patch version, upstream digest, installed packages, or files under `release-paths` | patch |
 | Nothing | no release |
 
-Tags per release, for Alpine 3.24.4 and version 1.0.1: `3.24.4`, `3.24`, `3` (moving) and `3.24.4-1.0.1`
-(immutable). The repository's default branch must accept pushes from `github-actions[bot]`, because the
+Tags per release, for Alpine 3.24.4 and version 1.0.1: `3.24.4`, `3.24`, `3` and `latest` (moving) and
+`3.24.4-1.0.1` (immutable). The repository's default branch must accept pushes from `github-actions[bot]`, because the
 release commit and tag are pushed with `GITHUB_TOKEN`.
 
 ### rescan.yaml

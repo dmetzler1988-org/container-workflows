@@ -57,6 +57,10 @@ on:
         description: Appended to every upstream tag, e.g. "-fpm". Empty for alpine-minimal.
         type: string
         default: ""
+      latest:
+        description: Also point the `latest` tag at this release. Set it only for the top version line's runtime variant.
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -297,6 +301,7 @@ jobs:
       VERSION: ${{ needs.decide.outputs.version }}
       ALPINE_VERSION: ${{ inputs.alpine-version }}
       TAG_SUFFIX: ${{ inputs.tag-suffix }}
+      LATEST: ${{ inputs.latest }}
     steps:
       - name: Download digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -328,11 +333,16 @@ jobs:
             echo "::error::$IMAGE:$immutable already exists; refusing to overwrite an immutable tag"
             exit 1
           fi
+          list="$ALPINE_VERSION$TAG_SUFFIX, $minor$TAG_SUFFIX, $major$TAG_SUFFIX, $immutable"
           set -- \
             -t "$IMAGE:$immutable" \
             -t "$IMAGE:$ALPINE_VERSION$TAG_SUFFIX" \
             -t "$IMAGE:$minor$TAG_SUFFIX" \
             -t "$IMAGE:$major$TAG_SUFFIX"
+          if [ "$LATEST" = "true" ]; then
+            set -- "$@" -t "$IMAGE:latest"
+            list="$list, latest"
+          fi
           for f in digests/*; do
             set -- "$@" "$IMAGE@$(cat "$f")"
           done
@@ -341,7 +351,7 @@ jobs:
           {
             echo "digest=$digest"
             echo "immutable=$immutable"
-            echo "list=$ALPINE_VERSION$TAG_SUFFIX, $minor$TAG_SUFFIX, $major$TAG_SUFFIX, $immutable"
+            echo "list=$list"
           } >> "$GITHUB_OUTPUT"
 
       - name: Sign and attest
