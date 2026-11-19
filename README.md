@@ -62,6 +62,13 @@ must accept pushes from `github-actions[bot]`, because the release commit and ta
 Put `concurrency` on the job that calls `release.yaml`, not on the whole workflow, so frequent runs that build
 nothing never cancel a waiting release.
 
+A release that fails halfway is finished by the next run:
+
+| State left behind | Next run |
+|---|---|
+| `versions.lock` and git tag written, some images not published | publishes the missing images, skips the rest |
+| Every image published, GitHub Release missing | writes only the GitHub Release |
+
 How the level is chosen (`scripts/semver-level.sh`), the highest wins:
 
 | Change since the last release | Level |

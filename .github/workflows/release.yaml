@@ -6,7 +6,8 @@ name: Release images
 #
 # Order matters: the git commit and tag come first, registry tags last. A run that fails after the git push
 # is resumed by a later run (mode "resume"): images whose immutable tag is still missing get published,
-# images that already have it are skipped.
+# images that already have it are skipped. When every image is published but the GitHub Release is missing,
+# a later run writes only the GitHub Release (mode "notes").
 #
 # Reads the facts__<key>__<arch> artifacts that build-image.yaml wrote in the same workflow run.
 
@@ -109,6 +110,7 @@ jobs:
         with:
           pattern: facts__*
           path: ${{ runner.temp }}/facts
+          merge-multiple: true
 
       - name: Build state
         id: state
@@ -117,7 +119,7 @@ jobs:
           IMAGES: ${{ inputs.images }}
           BASE: ${{ inputs.base }}
         run: |
-          facts=$(jq -s '.' "$RUNNER_TEMP"/facts/*/facts.json)
+          facts=$(jq -s '.' "$RUNNER_TEMP"/facts/*.json)
           problems=$(jq -n -r --argjson facts "$facts" --argjson images "$IMAGES" --argjson base "$BASE" '
             [ ($images[] | .key as $k
                 | select(([$facts[] | select(.key == $k)] | length) != 2)
@@ -175,6 +177,8 @@ jobs:
           VERSION: ${{ steps.level.outputs.version }}
           REASON: ${{ steps.level.outputs.reason }}
           DRY_RUN: ${{ inputs.dry-run }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
             {
@@ -217,12 +221,17 @@ jobs:
               missing="$missing $key"
             fi
           done
-          if [ -z "$missing" ]; then
-            echo "mode=none" >> "$GITHUB_OUTPUT"
+          if [ -n "$missing" ]; then
+            echo "::notice::Release $VERSION is recorded but not published for:$missing; resuming."
+            echo "mode=resume" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "::notice::Release $VERSION is recorded but not published for:$missing; resuming."
-          echo "mode=resume" >> "$GITHUB_OUTPUT"
+          if ! gh release view "v$VERSION" > /dev/null 2>&1; then
+            echo "::notice::Release $VERSION is published but its GitHub Release is missing; writing it."
+            echo "mode=notes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "mode=none" >> "$GITHUB_OUTPUT"
 
       - name: Heartbeat
         # GitHub disables scheduled workflows in public repos after 60 days without activity.
@@ -418,8 +427,6 @@ jobs:
           sh .container-workflows/scripts/compute-tags.sh "$upstream" "${TAG_SUFFIX:-}" "$VERSION" \
             "${MAJOR_TAG:-false}" "${LATEST:-false}" > "$RUNNER_TEMP/tags"
           immutable=$(head -n 1 "$RUNNER_TEMP/tags")
-          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
-          echo "list=$(paste -sd ',' "$RUNNER_TEMP/tags" | sed 's/,/, /g')" >> "$GITHUB_OUTPUT"
           if docker buildx imagetools inspect "$IMAGE:$immutable" > /dev/null 2>&1; then
             echo "::notice::$IMAGE:$immutable already exists (published by an earlier run); skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -454,42 +461,42 @@ jobs:
           cosign attest --yes --type cyclonedx --predicate "$RUNNER_TEMP/out/cyclonedx.json" "$ref"
           cosign attest --yes --type vuln --predicate "$RUNNER_TEMP/out/cosign-vuln.json" "$ref"
 
-      - name: Record published image
-        env:
-          UPSTREAM: ${{ steps.tags.outputs.upstream }}
-          DIGEST: ${{ steps.tags.outputs.digest }}
-          TAGS: ${{ steps.tags.outputs.list }}
-        run: |
-          mkdir -p "$RUNNER_TEMP/published"
-          jq -n --arg key "$KEY" --arg upstream "$UPSTREAM" --arg digest "$DIGEST" --arg tags "$TAGS" \
-            '{key: $key, upstreamVersion: $upstream, digest: $digest, tags: $tags}' > "$RUNNER_TEMP/published/published.json"
-
-      - name: Upload published image
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: published__${{ matrix.image.key }}
-          path: ${{ runner.temp }}/published/published.json
-          retention-days: 1
-
   notes:
     name: Publish GitHub Release
     runs-on: ubuntu-24.04
     needs: [decide, publish]
-    if: always() && needs.publish.result == 'success'
+    # Also runs alone (mode "notes") when an earlier run published every image but not the GitHub Release.
+    if: >-
+      always()
+      && (needs.publish.result == 'success' || needs.decide.outputs.mode == 'notes')
     permissions:
       contents: write
+      packages: read
     steps:
-      - name: Download published images
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Check out workflow scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          pattern: published__*
-          path: published
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .container-workflows
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           IMAGE: ${{ inputs.image }}
+          IMAGES: ${{ inputs.images }}
+          MODE: ${{ needs.decide.outputs.mode }}
           VERSION: ${{ needs.decide.outputs.version }}
           LEVEL: ${{ needs.decide.outputs.level }}
           REASON: ${{ needs.decide.outputs.reason }}
@@ -499,14 +506,34 @@ jobs:
             echo "::notice::GitHub Release v$VERSION already exists."
             exit 0
           fi
+          # Built from the registry, not from artifacts, so a later run can write it too.
+          rows=""
+          title=""
+          for key in $(printf '%s' "$IMAGES" | jq -r '.[].key' | sort); do
+            entry=$(printf '%s' "$IMAGES" | jq -c --arg k "$key" '.[] | select(.key == $k)')
+            upstream=$(printf '%s' "$STATE" | jq -r --arg k "$key" '.images[$k].upstreamVersion')
+            sh .container-workflows/scripts/compute-tags.sh "$upstream" \
+              "$(printf '%s' "$entry" | jq -r '.["tag-suffix"] // ""')" "$VERSION" \
+              "$(printf '%s' "$entry" | jq -r '.["major-tag"] // false')" \
+              "$(printf '%s' "$entry" | jq -r '.latest // false')" > "$RUNNER_TEMP/tags"
+            immutable=$(head -n 1 "$RUNNER_TEMP/tags")
+            digest=$(docker buildx imagetools inspect "$IMAGE:$immutable" --format '{{json .Manifest}}' | jq -r '.digest')
+            tags=$(paste -sd ',' "$RUNNER_TEMP/tags" | sed 's/,/, /g')
+            rows="$rows| $key | $upstream | $tags | \`$IMAGE@$digest\` |
+          "
+            title="$title${title:+, }$key $upstream"
+          done
           base=$(printf '%s' "$STATE" | jq -r '"\(.base.image) (Alpine \(.base.alpineVersion), digest `\(.base.digest)`)"')
           {
-            echo "- Level: $LEVEL ($REASON)"
+            if [ "$MODE" = "notes" ]; then
+              echo "- Level: recorded by an earlier run; this text was written afterwards"
+            else
+              echo "- Level: $LEVEL ($REASON)"
+            fi
             echo "- Base: $base"
             echo
             echo "| Image | Version | Tags | Digest |"
             echo "|---|---|---|---|"
-            jq -s -r --arg image "$IMAGE" 'sort_by(.key)[] | "| \(.key) | \(.upstreamVersion) | \(.tags) | `\($image)@\(.digest)` |"' published/*/published.json
+            printf '%s' "$rows"
           } > "$RUNNER_TEMP/notes.md"
-          title=$(jq -s -r 'sort_by(.key) | map("\(.key) \(.upstreamVersion)") | join(", ")' published/*/published.json)
           gh release create "v$VERSION" --title "$VERSION ($title)" --notes-file "$RUNNER_TEMP/notes.md"

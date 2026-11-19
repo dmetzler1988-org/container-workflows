@@ -161,14 +161,16 @@ jobs:
             --arg packages "$(sed -n 's/^packages-sha256=//p' "$RUNNER_TEMP/facts.env")" \
             --arg upstream "$(sed -n 's/^upstream-version=//p' "$RUNNER_TEMP/facts.env")" \
             '{key: $key, platform: $platform, alpineVersion: $alpine, packagesSha256: $packages, upstreamVersion: $upstream}' \
-            > "$RUNNER_TEMP/facts.json"
+            > "$RUNNER_TEMP/facts__${IMAGE_KEY}__${{ matrix.arch }}.json"
 
       - name: Upload image facts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # "__" separates key and arch, so key 3.14 never matches artifacts of key 3.14-dev.
+          # The file carries the same unique name, so downloads can use merge-multiple: one flat folder,
+          # no matter how many artifacts match (a single match is not put into a subfolder).
           name: facts__${{ inputs.image-key }}__${{ matrix.arch }}
-          path: ${{ runner.temp }}/facts.json
+          path: ${{ runner.temp }}/facts__${{ inputs.image-key }}__${{ matrix.arch }}.json
           retention-days: 1
 
   check:
@@ -182,13 +184,14 @@ jobs:
         with:
           pattern: facts__${{ inputs.image-key }}__*
           path: facts
+          merge-multiple: true
 
       - name: Same Alpine and upstream version on every architecture
         run: |
-          count=$(jq -s 'length' facts/*/facts.json)
-          distinct=$(jq -s '[.[] | {alpineVersion, upstreamVersion}] | unique | length' facts/*/facts.json)
+          count=$(jq -s 'length' facts/*.json)
+          distinct=$(jq -s '[.[] | {alpineVersion, upstreamVersion}] | unique | length' facts/*.json)
           if [ "$count" -ne 2 ] || [ "$distinct" -ne 1 ]; then
             echo "::error::Expected 2 architectures with identical versions:"
-            jq -s -c '.' facts/*/facts.json
+            jq -s -c '.' facts/*.json
             exit 1
           fi
