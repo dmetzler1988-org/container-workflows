@@ -11,10 +11,11 @@ env:
   ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
   SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
   BATS_IMAGE: bats/bats:1.14.0@sha256:5322b877351fda0cc435de8c6116de7d0a2ec79d7c680132a0ef329a633bc66f
+  YQ_IMAGE: mikefarah/yq:4.54.3@sha256:7834187596ad56fd5a81436114e0b0b9dd54c91bb43946d1f7145b2be5f9c3d2
 
 jobs:
   lint:
-    name: actionlint, shellcheck, bats
+    name: actionlint, action YAML, shellcheck, bats
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -24,6 +25,15 @@ jobs:
 
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo "$ACTIONLINT_IMAGE" -color
+
+      # actionlint checks workflows only. Composite actions are parsed separately: an action.yml that is not
+      # valid YAML (v2.1.0 shipped one) fails every workflow that uses it, at "Set up job".
+      - name: action YAML
+        run: |
+          for action in .github/actions/*/action.yml; do
+            docker run --rm -v "$PWD:/workdir" "$YQ_IMAGE" -e '.runs.using == "composite"' "$action" > /dev/null \
+              || { echo "::error file=$action::not valid YAML or not a composite action"; exit 1; }
+          done
 
       - name: shellcheck
         run: docker run --rm -v "$PWD:/mnt" -w /mnt "$SHELLCHECK_IMAGE" scripts/*.sh

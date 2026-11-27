@@ -8,12 +8,13 @@ inputs:
     description: Upstream project, python or php.
     required: true
   lines:
-    description: JSON array of version lines, e.g. ["3.14", "3.13"].
+    description: 'JSON array of version lines, e.g. ["3.14", "3.13"].'
     required: true
 
 outputs:
   versions:
-    description: JSON object, e.g. {"3.14": "3.14.10", "3.13": "3.13.18"}.
+    # Quoted: unquoted, YAML reads the {...} example as a mapping and GitHub rejects the whole action.
+    description: 'JSON object, e.g. {"3.14": "3.14.10", "3.13": "3.13.18"}.'
     value: ${{ steps.lookup.outputs.versions }}
 
 runs:
