@@ -25,15 +25,20 @@ jobs:
       security-events: write
     steps:
       - name: Scan
+        id: scan
         env:
           IMAGE_REF: ${{ inputs.image-ref }}
         run: |
           mkdir -p "$RUNNER_TEMP/out"
           docker run --rm -v "$RUNNER_TEMP/out:/out" \
             "$TRIVY_IMAGE" image --scanners vuln --format sarif --output /out/trivy.sarif "$IMAGE_REF"
+          # One Security tab category per image: uploads sharing a category replace each other's results.
+          # ghcr.io/owner/python-minimal:3.14-dev -> rescan-python-minimal-3.14-dev
+          category="rescan-$(printf '%s' "${IMAGE_REF##*/}" | tr ':@' '--')"
+          printf 'category=%s\n' "$category" >> "$GITHUB_OUTPUT"
 
       - name: Upload scan results
         uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
         with:
           sarif_file: ${{ runner.temp }}/out/trivy.sarif
-          category: rescan
+          category: ${{ steps.scan.outputs.category }}

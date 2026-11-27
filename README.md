@@ -107,7 +107,8 @@ Written only by `release.yaml`:
 ### rescan.yaml
 
 Input `image-ref`, e.g. `ghcr.io/dmetzler1988-org/alpine-minimal:3.24`. Caller job permissions:
-`contents: read`, `security-events: write`.
+`contents: read`, `security-events: write`. Results go to the Security tab under one category per image
+(`rescan-alpine-minimal-3.24`), so rescans of several images in one repository do not replace each other.
 
 ### dependabot-automerge.yaml
 
