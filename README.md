@@ -38,7 +38,7 @@ Writes the artifact `facts__<image-key>__<arch>` for `release.yaml`. Caller job 
 
 | Input | Default | Meaning |
 |---|---|---|
-| `image` | required | Image name without tag, e.g. `ghcr.io/dmetzler1988-org/python-minimal` |
+| `image` | empty | Image name without tag, e.g. `ghcr.io/dmetzler1988-org/python-minimal`. Used for every entry without its own `image`; the run fails when an entry ends up with none |
 | `images` | required | JSON list, one entry per image (below) |
 | `base` | required | JSON `{"image", "digest", "alpineVersion"}` of the base image the builds were pinned to |
 | `context`, `file`, `build-contexts`, `test-script` | as above | Same as given to `build-image.yaml`; each image is rebuilt from cache for the push and checked against the tested one |
@@ -53,8 +53,9 @@ One `images` entry:
 | `key` | Same `image-key` as in `build-image.yaml` |
 | `target`, `build-args`, `version-command` | Same as in `build-image.yaml` |
 | `tag-suffix` | Appended to every tag of this image, e.g. `-dev` |
+| `image` | Optional. Publishes this entry to its own package, e.g. `ghcr.io/dmetzler1988-org/php-fpm-minimal`, instead of `inputs.image` |
 | `major-tag` | `true` adds the major tag, e.g. `3` or `3-dev`. Only for the top version line |
-| `latest` | `true` adds `latest`. Only for the top line's runtime image |
+| `latest` | `true` adds `latest`. Only for the top line in each package; where variants share a package, never for `-dev` |
 
 Caller job permissions: `contents: write`, `packages: write`, `id-token: write`. The repository's default branch
 must accept pushes from `github-actions[bot]`, because the release commit and tag are pushed with `GITHUB_TOKEN`.

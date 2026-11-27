@@ -108,3 +108,35 @@ setup_releases() {
   run sh "$SCRIPTS/upstream-latest.sh" python 3
   [ "$status" -eq 2 ]
 }
+
+# resolve-images.sh
+
+@test "resolve-images: entries without image get the default" {
+  run sh "$SCRIPTS/resolve-images.sh" ghcr.io/o/python-minimal '[{"key":"3.14"},{"key":"3.13","image":""}]'
+  [ "$status" -eq 0 ]
+  [ "$output" = '[{"key":"3.14","image":"ghcr.io/o/python-minimal"},{"key":"3.13","image":"ghcr.io/o/python-minimal"}]' ]
+}
+
+@test "resolve-images: an entry's own image wins over the default" {
+  run sh "$SCRIPTS/resolve-images.sh" ghcr.io/o/php-minimal '[{"key":"8.6-fpm","image":"ghcr.io/o/php-fpm-minimal"}]'
+  [ "$status" -eq 0 ]
+  [ "$output" = '[{"key":"8.6-fpm","image":"ghcr.io/o/php-fpm-minimal"}]' ]
+}
+
+@test "resolve-images: no default needed when every entry has its own image" {
+  run sh "$SCRIPTS/resolve-images.sh" "" '[{"key":"8.6-cli","image":"ghcr.io/o/php-cli-minimal"}]'
+  [ "$status" -eq 0 ]
+  [ "$output" = '[{"key":"8.6-cli","image":"ghcr.io/o/php-cli-minimal"}]' ]
+}
+
+@test "resolve-images: an entry left without any image is rejected with exit 2" {
+  run sh "$SCRIPTS/resolve-images.sh" "" '[{"key":"8.6-cli","image":"ghcr.io/o/php-cli-minimal"},{"key":"8.5-cli"}]'
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"8.5-cli has no image name"* ]]
+}
+
+@test "resolve-images: wrong argument count is rejected with exit 2" {
+  run sh "$SCRIPTS/resolve-images.sh" ghcr.io/o/x
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"expected 2 arguments"* ]]
+}

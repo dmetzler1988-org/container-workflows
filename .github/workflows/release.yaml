@@ -15,13 +15,16 @@ on:
   workflow_call:
     inputs:
       image:
-        description: Image name without tag, e.g. ghcr.io/owner/python-minimal.
+        description: >-
+          Image name without tag, e.g. ghcr.io/owner/python-minimal. Used for every entry of `images` that has
+          no "image" of its own; may be empty when every entry has one.
         type: string
-        required: true
+        default: ""
       images:
         description: >-
           JSON list, one entry per image: {"key", "target", "build-args", "tag-suffix", "major-tag", "latest",
-          "version-command"}. Same keys, targets and build arguments as given to build-image.yaml.
+          "version-command", "image"}. "image" is optional and publishes that entry to its own package, e.g.
+          ghcr.io/owner/php-fpm-minimal. Same keys, targets and build arguments as given to build-image.yaml.
         type: string
         required: true
       base:
@@ -77,6 +80,7 @@ jobs:
       version: ${{ steps.level.outputs.version }}
       reason: ${{ steps.level.outputs.reason }}
       state: ${{ steps.state.outputs.state }}
+      images: ${{ steps.state.outputs.images }}
       push-matrix: ${{ steps.state.outputs.push-matrix }}
     steps:
       - name: Check out default branch
@@ -116,9 +120,12 @@ jobs:
         id: state
         if: steps.head.outputs.stale == 'false'
         env:
-          IMAGES: ${{ inputs.images }}
+          IMAGE: ${{ inputs.image }}
+          IMAGES_INPUT: ${{ inputs.images }}
           BASE: ${{ inputs.base }}
         run: |
+          # Every later step and job reads this list, so each entry carries its resolved package name.
+          IMAGES=$(sh .container-workflows/scripts/resolve-images.sh "$IMAGE" "$IMAGES_INPUT")
           facts=$(jq -s '.' "$RUNNER_TEMP"/facts/*.json)
           problems=$(jq -n -r --argjson facts "$facts" --argjson images "$IMAGES" --argjson base "$BASE" '
             [ ($images[] | .key as $k
@@ -142,11 +149,12 @@ jobs:
             $images[] as $i
             | ({platform: "linux/amd64", arch: "amd64", runner: "ubuntu-24.04"},
                {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"})
-            | . + {key: $i.key, target: ($i.target // ""), "build-args": ($i["build-args"] // ""),
+            | . + {key: $i.key, image: $i.image, target: ($i.target // ""), "build-args": ($i["build-args"] // ""),
                    "version-command": ($i["version-command"] // "cat /etc/alpine-release")}
           ]')
           {
             echo "state=$state"
+            echo "images=$IMAGES"
             echo "push-matrix=$push_matrix"
           } >> "$GITHUB_OUTPUT"
 
@@ -170,8 +178,7 @@ jobs:
         id: mode
         if: steps.head.outputs.stale == 'false'
         env:
-          IMAGE: ${{ inputs.image }}
-          IMAGES: ${{ inputs.images }}
+          IMAGES: ${{ steps.state.outputs.images }}
           STATE: ${{ steps.state.outputs.state }}
           LEVEL: ${{ steps.level.outputs.level }}
           VERSION: ${{ steps.level.outputs.version }}
@@ -187,16 +194,17 @@ jobs:
               echo "- Level: $LEVEL ($REASON)"
               echo "- Version: $VERSION"
               echo
-              echo "| Image | Upstream | Tags |"
-              echo "|---|---|---|"
+              echo "| Image | Package | Upstream | Tags |"
+              echo "|---|---|---|---|"
               printf '%s' "$IMAGES" | jq -c '.[]' | while IFS= read -r entry; do
                 key=$(printf '%s' "$entry" | jq -r '.key')
+                image=$(printf '%s' "$entry" | jq -r '.image')
                 upstream=$(printf '%s' "$STATE" | jq -r --arg k "$key" '.images[$k].upstreamVersion')
                 tags=$(sh .container-workflows/scripts/compute-tags.sh "$upstream" \
                   "$(printf '%s' "$entry" | jq -r '.["tag-suffix"] // ""')" "$VERSION" \
                   "$(printf '%s' "$entry" | jq -r '.["major-tag"] // false')" \
                   "$(printf '%s' "$entry" | jq -r '.latest // false')" | paste -sd ' ' -)
-                echo "| $key | $upstream | $tags |"
+                echo "| $key | $image | $upstream | $tags |"
               done
               echo
               echo "versions.lock that a release would write:"
@@ -215,9 +223,10 @@ jobs:
           missing=""
           for key in $(printf '%s' "$IMAGES" | jq -r '.[].key'); do
             entry=$(printf '%s' "$IMAGES" | jq -c --arg k "$key" '.[] | select(.key == $k)')
+            image=$(printf '%s' "$entry" | jq -r '.image')
             upstream=$(jq -r --arg k "$key" '.images[$k].upstreamVersion' versions.lock)
             suffix=$(printf '%s' "$entry" | jq -r '.["tag-suffix"] // ""')
-            if ! docker buildx imagetools inspect "$IMAGE:$upstream$suffix-$VERSION" > /dev/null 2>&1; then
+            if ! docker buildx imagetools inspect "$image:$upstream$suffix-$VERSION" > /dev/null 2>&1; then
               missing="$missing $key"
             fi
           done
@@ -322,14 +331,14 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-contexts: ${{ inputs.build-contexts }}
           build-args: ${{ matrix.build-args }}
-          outputs: type=image,name=${{ inputs.image }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: false
           cache-from: type=gha,scope=${{ github.repository }}-${{ matrix.key }}-${{ matrix.arch }}
 
       - name: Verify pushed image equals the tested one
         env:
-          IMAGE_REF: ${{ inputs.image }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ matrix.image }}@${{ steps.build.outputs.digest }}
           KEY: ${{ matrix.key }}
           PLATFORM: ${{ matrix.platform }}
           VERSION_COMMAND: ${{ matrix.version-command }}
@@ -351,7 +360,7 @@ jobs:
 
       - name: Test pushed image
         env:
-          IMAGE: ${{ inputs.image }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ matrix.image }}@${{ steps.build.outputs.digest }}
           IMAGE_KEY: ${{ matrix.key }}
           TEST_SCRIPT: ${{ inputs.test-script }}
         run: ./"$TEST_SCRIPT"
@@ -382,9 +391,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJSON(inputs.images) }}
+        image: ${{ fromJSON(needs.decide.outputs.images) }}
     env:
-      IMAGE: ${{ inputs.image }}
+      IMAGE: ${{ matrix.image.image }}
       KEY: ${{ matrix.image.key }}
       VERSION: ${{ needs.decide.outputs.version }}
       STATE: ${{ needs.decide.outputs.state }}
@@ -494,8 +503,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          IMAGE: ${{ inputs.image }}
-          IMAGES: ${{ inputs.images }}
+          IMAGES: ${{ needs.decide.outputs.images }}
           MODE: ${{ needs.decide.outputs.mode }}
           VERSION: ${{ needs.decide.outputs.version }}
           LEVEL: ${{ needs.decide.outputs.level }}
@@ -511,15 +519,16 @@ jobs:
           title=""
           for key in $(printf '%s' "$IMAGES" | jq -r '.[].key' | sort); do
             entry=$(printf '%s' "$IMAGES" | jq -c --arg k "$key" '.[] | select(.key == $k)')
+            image=$(printf '%s' "$entry" | jq -r '.image')
             upstream=$(printf '%s' "$STATE" | jq -r --arg k "$key" '.images[$k].upstreamVersion')
             sh .container-workflows/scripts/compute-tags.sh "$upstream" \
               "$(printf '%s' "$entry" | jq -r '.["tag-suffix"] // ""')" "$VERSION" \
               "$(printf '%s' "$entry" | jq -r '.["major-tag"] // false')" \
               "$(printf '%s' "$entry" | jq -r '.latest // false')" > "$RUNNER_TEMP/tags"
             immutable=$(head -n 1 "$RUNNER_TEMP/tags")
-            digest=$(docker buildx imagetools inspect "$IMAGE:$immutable" --format '{{json .Manifest}}' | jq -r '.digest')
+            digest=$(docker buildx imagetools inspect "$image:$immutable" --format '{{json .Manifest}}' | jq -r '.digest')
             tags=$(paste -sd ',' "$RUNNER_TEMP/tags" | sed 's/,/, /g')
-            rows="$rows| $key | $upstream | $tags | \`$IMAGE@$digest\` |
+            rows="$rows| $key | $upstream | $tags | \`$image@$digest\` |
           "
             title="$title${title:+, }$key $upstream"
           done
