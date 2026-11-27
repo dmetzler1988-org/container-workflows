@@ -1,0 +1,41 @@
+name: Upstream latest versions
+description: >-
+  Newest published patch release for each version line of an upstream project
+  (python.org or php.net), as a JSON object line -> version.
+
+inputs:
+  kind:
+    description: Upstream project, python or php.
+    required: true
+  lines:
+    description: JSON array of version lines, e.g. ["3.14", "3.13"].
+    required: true
+
+outputs:
+  versions:
+    description: JSON object, e.g. {"3.14": "3.14.10", "3.13": "3.13.18"}.
+    value: ${{ steps.lookup.outputs.versions }}
+
+runs:
+  using: composite
+  steps:
+    - name: Look up newest patch per line
+      id: lookup
+      shell: bash
+      env:
+        KIND: ${{ inputs.kind }}
+        LINES: ${{ inputs.lines }}
+        SCRIPT: ${{ github.action_path }}/../../../scripts/upstream-latest.sh
+      run: |
+        set -euo pipefail
+        versions='{}'
+        # A for loop, not a pipe: an error for one line must fail this step.
+        for line in $(printf '%s' "$LINES" | jq -r '.[]'); do
+          latest=$(sh "$SCRIPT" "$KIND" "$line")
+          versions=$(printf '%s' "$versions" | jq -c --arg line "$line" --arg v "$latest" '. + {($line): $v}')
+        done
+        if [ "$versions" = '{}' ]; then
+          echo "::error::No version lines given"
+          exit 1
+        fi
+        printf 'versions=%s\n' "$versions" >> "$GITHUB_OUTPUT"

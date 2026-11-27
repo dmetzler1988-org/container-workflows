@@ -115,6 +115,24 @@ Input `image-ref`, e.g. `ghcr.io/dmetzler1988-org/alpine-minimal:3.24`. Caller j
 No inputs. Caller job permissions: `contents: write`, `pull-requests: write`. Merges with `GITHUB_TOKEN`, so
 the merge itself starts no new workflow run; the next scheduled build picks it up.
 
+## Actions
+
+### upstream-latest
+
+Newest published patch release per version line, from python.org or php.net. Image repositories use it for
+their hourly "is there a new upstream release?" check.
+
+```yaml
+- id: upstream
+  uses: dmetzler1988-org/container-workflows/.github/actions/upstream-latest@<commit-sha> # v2.1.0
+  with:
+    kind: php                 # python | php
+    lines: '["8.6", "8.5"]'
+# ${{ steps.upstream.outputs.versions }} -> {"8.6": "8.6.0", "8.5": "8.5.13"}
+```
+
+The step fails when any line has no published release, e.g. a line that does not exist yet.
+
 ## Upgrading from v1
 
 v2 is a breaking change:

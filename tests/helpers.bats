@@ -78,6 +78,32 @@ setup_releases() {
   [[ "$output" == *"no published python 3.15 release found"* ]]
 }
 
+@test "upstream-latest: php returns the line's current version" {
+  printf '%s\n' '{"announcement": true, "version": "8.6.0", "date": "19 Nov 2026"}' > "$BATS_TEST_TMPDIR/php.json"
+  UPSTREAM_JSON_FILE="$BATS_TEST_TMPDIR/php.json" run sh "$SCRIPTS/upstream-latest.sh" php 8.6
+  [ "$status" -eq 0 ]
+  [ "$output" = "8.6.0" ]
+}
+
+@test "upstream-latest: php unknown line (HTTP 200 with an error object) fails" {
+  printf '%s\n' '{"error": "Unknown version"}' > "$BATS_TEST_TMPDIR/php.json"
+  UPSTREAM_JSON_FILE="$BATS_TEST_TMPDIR/php.json" run sh "$SCRIPTS/upstream-latest.sh" php 8.7
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"no published php 8.7 release found"* ]]
+}
+
+@test "upstream-latest: php answer for another line is rejected" {
+  printf '%s\n' '{"version": "8.5.13"}' > "$BATS_TEST_TMPDIR/php.json"
+  UPSTREAM_JSON_FILE="$BATS_TEST_TMPDIR/php.json" run sh "$SCRIPTS/upstream-latest.sh" php 8.6
+  [ "$status" -eq 1 ]
+}
+
+@test "upstream-latest: unknown kind is rejected with exit 2" {
+  run sh "$SCRIPTS/upstream-latest.sh" ruby 3.4
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"unknown KIND 'ruby'"* ]]
+}
+
 @test "upstream-latest: invalid line is rejected with exit 2" {
   run sh "$SCRIPTS/upstream-latest.sh" python 3
   [ "$status" -eq 2 ]
